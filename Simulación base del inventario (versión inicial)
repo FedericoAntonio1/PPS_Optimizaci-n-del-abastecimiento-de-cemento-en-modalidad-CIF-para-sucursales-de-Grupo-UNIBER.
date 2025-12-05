@@ -1,0 +1,167 @@
+// ===== SIMULACIÓN INVENTARIO – objetivo + salto t+2 (sin arrastre, demanda limitada ±2σ) =====
+mode(-1);
+
+// ---------- UTILIDADES ----------
+function safe_seed(seed)
+    if argn(2) == 0 then return; end
+    if ~isnum(seed) then return; end
+    try
+        grand("setsd", seed);
+    catch
+        try
+            rand("seed", seed);
+        catch
+            // sin seed reproducible
+        end
+    end
+endfunction
+
+function z = dow(t)
+    // 1=Lun .. 7=Dom
+    z = modulo(t-1, 7) + 1;
+endfunction
+
+function n = safe_round_pos(x)
+    n = max(0, round(x));
+endfunction
+
+// ---------- FUNCIÓN PRINCIPAL ----------
+function [res] = sim_fixed_receipt_with_target(params)
+    // params: days, mu, sigma, season[1x7], receipt_plan[1x7], receipt_cap,
+    //          init_inv, target_stock, seed (opcional)
+
+    if isfield(params, "seed") then
+        safe_seed(params.seed);
+    end
+
+    days   = params.days;
+    mu     = params.mu;
+    sigma  = params.sigma;
+    season = params.season;            // 1..7
+    cap    = params.receipt_cap;
+    plan   = params.receipt_plan;      // 1..7
+    onhand = params.init_inv;
+    target = params.target_stock;
+
+    if size(season, "*") <> 7 then error("season debe tener 7 elementos (Lun..Dom)."); end
+    if size(plan,   "*") <> 7 then error("receipt_plan debe tener 7 elementos (Lun..Dom)."); end
+    if sigma < 0 then error("sigma debe ser >= 0."); end
+    if cap   < 0 then error("receipt_cap debe ser >= 0."); end
+
+    demand    = zeros(days,1);
+    received  = zeros(days,1);
+    served    = zeros(days,1);
+    lost      = zeros(days,1);
+    stockout  = zeros(days,1);
+    onhand_v  = zeros(days,1);
+
+    skip_flag  = zeros(days,1); // 1 => no recibe ese día
+    skip_log   = [];            // días con salto (t+2)
+    target_log = [];            // días cuyo cierre >= target
+
+    for t = 1:days
+        w = dow(t);
+
+        // 1) Recepción al inicio del día (con tope cap y regla de salto)
+        rcv_plan = plan(w);
+        if skip_flag(t) == 1 then
+            rcv = 0;                  // se saltea recepción este día
+        else
+            rcv = min(rcv_plan, cap); // sin arrastre: lo no recibido se pierde
+        end
+        received(t) = rcv;
+        onhand = onhand + rcv;
+
+        // 2) Demanda del día con estacionalidad y restricción ±2σ
+        d_raw = mu + sigma * rand(1,1,"normal");  // demanda base
+        d_adj = d_raw * season(w);                // aplicar estacionalidad
+
+        // límites inferior y superior
+        lower = mu * season(w) - 2 * sigma * season(w);
+        upper = mu * season(w) + 2 * sigma * season(w);
+
+        // aplicar recorte (clip)
+        d_clip = min(max(d_adj, lower), upper);
+
+        d = safe_round_pos(d_clip);
+        demand(t) = d;
+
+        // 3) Ventas perdidas (sin backorders)
+        sell = min(onhand, d);
+        served(t) = sell;
+        lost(t)   = d - sell;
+        onhand    = onhand - sell;
+        if lost(t) > 0 then stockout(t) = 1; end
+
+        onhand_v(t) = onhand;
+
+        // 4) Chequeo de objetivo y programación del salto t+2
+        if onhand >= target then
+            target_log = [target_log; t];     // guardamos el día que alcanzó/superó el objetivo
+            if (t+2) <= days then
+                skip_flag(t+2) = 1;           // en t+2 no se recibe
+                skip_log  = [skip_log; t+2];
+            end
+        end
+    end
+
+    // Resultado final
+    res = struct( ...
+        "demand",          demand, ...
+        "received",        received, ...
+        "served",          served, ...
+        "lost",            lost, ...
+        "onhand",          onhand_v, ...
+        "stockout_days",   sum(stockout), ...
+        "fill_rate",       sum(served) / max(1, sum(demand)), ...
+        "ending_onhand",   onhand, ...
+        "skip_count",      size(skip_log, "*"), ...
+        "skip_days",       skip_log', ...
+        "target_stock",    target, ...
+        "days_at_or_over_target", size(target_log, "*"), ...
+        "at_or_over_days", target_log' ...
+    );
+endfunction
+
+// ---------- PARÁMETROS DE EJEMPLO ----------
+params = struct();
+params.days         = 365;
+params.mu           = 115.7454936;
+params.sigma        = 64.00585279;
+params.season       = [1.07, 1.23, 1.10, 1.11, 1.11, 0.41, 0.00]; // Lun..Dom
+params.receipt_cap  = 308;
+params.receipt_plan = [160, 128, 160, 128, 128, 0, 0];            // Lun..Dom
+params.init_inv     = 400;
+params.target_stock = 256;
+// params.seed      = 12345; // opcional y reproducible
+
+// ---------- CORRER ----------
+try
+    res = sim_fixed_receipt_with_target(params);
+
+    mprintf("\n--- RESULTADOS ---\n");
+    mprintf("Días con quiebre:              %d\n", res.stockout_days);
+    mprintf("Fill rate:                     %.2f %%\n", 100*res.fill_rate);
+    mprintf("Stock final:                   %.2f t\n", res.ending_onhand);
+    mprintf("Saltos aplicados (t+2):        %d\n", res.skip_count);
+    mprintf("Días con stock >= %d t:        %d\n", res.target_stock, res.days_at_or_over_target);
+
+    if res.skip_count > 0 then
+        mprintf("Días con salto (t+2): ");
+        disp(res.skip_days);
+    end
+    if res.days_at_or_over_target > 0 then
+        mprintf("Días con stock >= objetivo: ");
+        disp(res.at_or_over_days);
+    end
+
+    scf();
+    plot(1:params.days, res.onhand);
+    xlabel("Día"); ylabel("Inventario (t)");
+    title("Inventario diario (demanda recortada ±2σ)"); 
+    xgrid();
+
+catch
+    mprintf("\n*** ERROR EN EJECUCIÓN ***\n");
+    disp(lasterror());
+end
